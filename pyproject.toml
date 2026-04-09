@@ -38,6 +38,10 @@ vla-eval = "vla_eval.cli.main:main"
 
 [tool.ruff]
 line-length = 119
+extend-exclude = ["external/"]
+
+[tool.ty.src]
+exclude = ["external/"]
 
 [tool.ty.environment]
 python-version = "3.11"

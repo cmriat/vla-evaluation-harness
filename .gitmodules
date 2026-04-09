@@ -1,0 +1,4 @@
+[submodule "external/LLVM"]
+	path = external/LLVM
+	url = https://github.com/cmriat/LLVM.git
+	branch = xx/gr00tn15
