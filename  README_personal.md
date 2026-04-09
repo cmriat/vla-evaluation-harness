@@ -242,3 +242,115 @@ groups=1000(xxx),999(docker)
 ```zsh
 docker run hello-world
 ```
+
+## 9. 打通 Docker + NVIDIA GPU（Container Toolkit / CDI）
+> 目标：让 Docker 容器可以正确访问宿主机 GPU
+### 9.1 安装 NVIDIA Container Toolkit
+```zsh
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+  sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+sudo apt update
+sudo apt install -y nvidia-container-toolkit
+```
+
+### 9.2 配置 Docker 支持 GPU
+```zsh
+sudo nvidia-ctk runtime configure --runtime=docker --cdi.enabled=true
+```
+
+### 9.3 生成 CDI 配置文件
+```zsh
+sudo mkdir -p /etc/cdi
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+### 9.4 重启 Docker
+```zsh
+sudo systemctl restart docker
+```
+
+### 9.5 验证 Docker 能否识别 GPU
+```zsh
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+## 10. 从 4090 裸金属访问 Coder Workspace
+
+> 目标：让本地 4090 裸金属机器作为 benchmark client，连接到远程 Coder Workspace 上运行的 model server。
+
+### 10.1 安装 Coder CLI
+```zsh
+curl -L https://coder.com/install.sh | sh
+```
+
+### 10.2 登录 Coder
+```zsh
+coder login https://coder.lionrock.com/
+```
+
+### 10.3 配置 hosts 解析
+由于 Coder 平台的域名可能需要手动解析，编辑 `/etc/hosts`：
+```zsh
+sudo code /etc/hosts
+```
+添加以下内容（IP 根据实际情况修改）：
+```
+106.13.249.94 coder.lionrock.com
+106.13.249.94 8000--main--xiaoxiong-8gpu-0--xiaoxiong-sherry.coder.lionrock.com
+```
+> **前提**：需要先在 Coder Workspace（GPU 服务器）上启动 model server：
+> ```zsh
+> vla-eval serve --config configs/model_servers/dexbotic_cogact_libero.yaml
+> ```
+> 启动后才能在 Coder 面板上看到对应端口并获取地址。
+>
+> **获取地址的步骤**：
+> 1. 打开 https://coder.lionrock.com/，找到目标 Workspace
+> 2. 点击 **Open Ports** 按钮
+> 3. 找到 model server 对应的端口
+> 4. 点击 **Share this port**，将 Sharing Level 改为 **Public**
+> 5. 右键复制链接地址
+
+### 10.4 修改评测配置文件
+编辑 `configs/libero_smoke_test.yaml`，将 `server.url` 指向 Coder Workspace 的 model server 地址：
+```yaml
+server:
+  url: "wss://8000--main--xiaoxiong-8gpu-0--xiaoxiong-sherry.coder.lionrock.com"
+```
+
+### 10.5 修改连接代码
+
+Coder Workspace 使用 `wss://`（TLS）连接，但其证书不被默认信任，需要在 `src/vla_eval/connection.py` 的 `_connect_with_backoff` 方法中添加 SSL 支持并跳过证书验证。
+
+具体改动：
+
+1. **第 7 行：新增 `import ssl`**
+
+2. **第 192~202 行：修改 `_connect_with_backoff` 方法**，将原来直接传参的 `websockets.connect` 调用改为先构建 `kwargs` 字典，再根据 URL 协议决定是否注入 SSL 上下文：
+```python
+kwargs: dict[str, Any] = dict(
+    compression=None,
+    max_size=None,
+    ping_interval=None,  # server may block GIL during JIT warmup
+)
+if self.url.startswith("wss://"):
+    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    kwargs["ssl"] = ssl_ctx
+self._ws = await websockets.connect(self.url, **kwargs)
+```
+
+> **为什么要跳过证书验证**：Coder 平台暴露的端口使用的 TLS 证书通常是自签名的或不被系统 CA 信任，直接连接会报 `ssl.SSLCertVerificationError`。设置 `check_hostname=False` + `CERT_NONE` 可以绕过这个问题。
+
+### 10.6 运行评测
+完成以上配置后，在 4090 裸金属机器上执行：
+```zsh
+vla-eval run --dev --config configs/libero_smoke_test.yaml
+```
+> `--dev` 标志会把本地修改过的 `src/` 目录挂载到 Docker 容器的 `/workspace/src`，这样容器内会使用你本地的代码改动（如 10.5 中的 SSL 修改），而不需要重新构建镜像。

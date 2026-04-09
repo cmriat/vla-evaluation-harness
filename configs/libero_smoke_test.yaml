@@ -1,6 +1,6 @@
 # Minimal smoke test: 1 task, 1 episode
 server:
-  url: "ws://localhost:8000"
+  url: "wss://8000--main--xiaoxiong-8gpu-0--xiaoxiong-sherry.coder.lionrock.com"
 
 docker:
   image: ghcr.io/allenai/vla-evaluation-harness/libero:latest

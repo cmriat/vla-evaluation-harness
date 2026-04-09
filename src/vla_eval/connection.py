@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 from typing import Any, Callable
 
 import anyio
@@ -188,12 +189,17 @@ class Connection:
         for attempt in range(1, self.max_retries + 1):
             try:
                 with anyio.fail_after(self.timeout):
-                    self._ws = await websockets.connect(
-                        self.url,
+                    kwargs: dict[str, Any] = dict(
                         compression=None,
                         max_size=None,
                         ping_interval=None,  # server may block GIL during JIT warmup
                     )
+                    if self.url.startswith("wss://"):
+                        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        ssl_ctx.check_hostname = False
+                        ssl_ctx.verify_mode = ssl.CERT_NONE
+                        kwargs["ssl"] = ssl_ctx
+                    self._ws = await websockets.connect(self.url, **kwargs)
                 logger.info("Connected to %s (attempt %d/%d)", self.url, attempt, self.max_retries)
                 return
             except anyio.get_cancelled_exc_class():
