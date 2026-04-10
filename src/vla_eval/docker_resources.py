@@ -75,7 +75,7 @@ def gpu_docker_flag(spec: str | None) -> list[str]:
     """Return ``--gpus`` flag pair for a single (non-sharded) container."""
     if spec is None or spec.strip().lower() == "all":
         return ["--gpus", "all"]
-    return ["--gpus", f"device={spec}"]
+    return ["--gpus", f'"device={spec}"']
 
 
 def shard_docker_flags(
