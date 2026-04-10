@@ -557,6 +557,7 @@ class GR00TBaseModelServer(PredictModelServer):
         assert self._model is not None
 
         B = len(obs_batch)
+        logger.info("predict_batch: B=%d", B)
         texts: list[str] = []
         flat_images: list[Image.Image] = []
         states: list[np.ndarray] = []
