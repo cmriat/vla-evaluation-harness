@@ -130,15 +130,29 @@ class Orchestrator:
         try:
             for item_idx, (task, ep) in enumerate(work_items):
                 task_name = task.get("name", str(task))
+                # Preserve the task's own episode_idx if the benchmark set one
+                # (e.g. RobotWin uses it as a per-scenario counter when many
+                # "tasks" share the same name).  Otherwise default to ep.
+                task_own_idx = task.get("episode_idx")
+                has_own_idx = task_own_idx is not None
+                # Build a globally-unique episode_id.  When the task carries its own
+                # scenario index, include it so duplicate task names do not collide
+                # on merge.
+                if has_own_idx and cfg.episodes_per_task > 1:
+                    episode_id = f"{task_name}_t{task_own_idx}_ep{ep}"
+                elif has_own_idx:
+                    episode_id = f"{task_name}_ep{task_own_idx}"
+                else:
+                    episode_id = f"{task_name}_ep{ep}"
                 try:
-                    episode_idx = ep
+                    episode_idx = task_own_idx if has_own_idx else ep
                     max_ep = metadata.get("max_episodes_per_task")
                     if cfg.throughput_mode and max_ep is not None:
-                        episode_idx = ep % max_ep
+                        episode_idx = episode_idx % max_ep
                     task = {**task, "episode_idx": episode_idx}
                     raw = await runner.run_episode(benchmark, task, conn, max_steps=max_steps)
                     raw["task"] = task_name
-                    raw["episode_id"] = f"{task_name}_ep{ep}"
+                    raw["episode_id"] = episode_id
                     ep_result = cast(EpisodeResult, raw)
                     collector.record(task_name, ep_result)
                     status = "SUCCESS" if ep_result.get("success") else "FAIL"
@@ -164,7 +178,7 @@ class Orchestrator:
                         task_name,
                         {
                             "task": task_name,
-                            "episode_id": f"{task_name}_ep{ep}",
+                            "episode_id": episode_id,
                             "success": False,
                             "failure_reason": "server_unreachable",
                         },
@@ -186,7 +200,7 @@ class Orchestrator:
                         task_name,
                         {
                             "task": task_name,
-                            "episode_id": f"{task_name}_ep{ep}",
+                            "episode_id": episode_id,
                             "success": False,
                             "failure_reason": f"connection_closed_{close_code}",
                         },
@@ -209,7 +223,7 @@ class Orchestrator:
                         task_name,
                         {
                             "task": task_name,
-                            "episode_id": f"{task_name}_ep{ep}",
+                            "episode_id": episode_id,
                             "success": False,
                             "failure_reason": "timeout",
                         },
@@ -231,7 +245,7 @@ class Orchestrator:
                         task_name,
                         {
                             "task": task_name,
-                            "episode_id": f"{task_name}_ep{ep}",
+                            "episode_id": episode_id,
                             "success": False,
                             "failure_reason": "exception",
                         },

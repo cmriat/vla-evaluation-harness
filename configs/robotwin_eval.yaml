@@ -4,7 +4,7 @@ server:
 
 docker:
   image: ghcr.io/allenai/vla-evaluation-harness/robotwin:latest
-  gpus: "4,5,6,7"
+  gpus: "4"
   volumes:
     - "/home/xiongxiao/repo/vla-evaluation-harness/configs/robotwin_task_configs/agilex_random.yml:/app/RoboTwin/task_config/agilex_random.yml"
 
@@ -15,11 +15,11 @@ benchmarks:
     mode: sync
     episodes_per_task: 1
     params:
-      task_name: beat_block_hammer
+      task_name: adjust_bottle
       task_config: agilex_random
       seed: 0
       instruction_type: unseen
-      test_num: 10
+      test_num: 100
       skip_expert_check: false
     action_dim: 14
 
