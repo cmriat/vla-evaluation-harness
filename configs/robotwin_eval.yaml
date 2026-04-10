@@ -4,6 +4,8 @@ server:
 
 docker:
   image: ghcr.io/allenai/vla-evaluation-harness/robotwin:latest
+  volumes:
+    - "/home/jovyan/repo/vla-evaluation-harness/configs/robotwin_task_configs/agilex_random.yml:/app/RoboTwin/task_config/agilex_random.yml"
 
 output_dir: "./results"
 
@@ -12,11 +14,12 @@ benchmarks:
     mode: sync
     episodes_per_task: 1
     params:
-      task_name: grab_roller
-      task_config: demo_clean
+      task_name: beat_block_hammer
+      task_config: agilex_random
       seed: 0
-      instruction_type: seen
-      test_num: 1
-      skip_expert_check: true
+      instruction_type: unseen
+      test_num: 100
+      skip_expert_check: false
     action_dim: 14
+
 

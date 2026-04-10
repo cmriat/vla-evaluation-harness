@@ -5,7 +5,7 @@
 
 script: "src/vla_eval/model_servers/groot_base.py"
 args:
-  model_path: /data/checkpoints/gr00t-n1.5-finetune/step-211500
+  model_path: /data/checkpoints/gr00t-n1.5-base-finetune/epoch-60
   train_data_path: /data/robotwin/gr00t_train_multi_data
   embodiment_tag: robotwin/agilex_random
   denoising_steps: 8
