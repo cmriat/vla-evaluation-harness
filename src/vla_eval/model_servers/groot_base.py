@@ -488,22 +488,22 @@ class GR00TBaseModelServer(PredictModelServer):
             self._device,
         )
 
-    def predict(self, obs: Observation, ctx: SessionContext) -> Action:
-        self._load_model()
-        assert self._model is not None and self._stats is not None
+    def _encode_one(self, obs: Observation) -> tuple[str, list[Image.Image], np.ndarray]:
+        """Encode a single observation into (text, images, state_norm).
 
-        # --- Images: HWC uint8 → 224×224 PIL ---
+        ``state_norm`` is a 1-D array of length ``max_state_dim``.
+        """
+        assert self._stats is not None
+
         images_dict = obs.get("images", {})
         images = [_preprocess_frame(images_dict[k]) for k in _CAM_KEYS if k in images_dict]
 
-        # --- Text: ChatML with image placeholders ---
         instruction = obs.get("task_description", "")
         text = "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n<|im_start|>user\n"
         for i in range(1, len(images) + 1):
             text += f"<image-{i}>"
         text += f"{instruction}<|im_end|>\n<|im_start|>assistant\n"
 
-        # --- State: normalize + pad ---
         joint_state = obs.get("joint_state", obs.get("state"))
         if joint_state is None:
             joint_vec = np.zeros(14, dtype=np.float32)
@@ -518,7 +518,14 @@ class GR00TBaseModelServer(PredictModelServer):
         else:
             state_norm = state_norm[:, : self._max_state_dim]
 
-        # --- Eagle processor (tokenize text + tile images) ---
+        return text, images, state_norm[0]  # state shape: (max_state_dim,)
+
+    def predict(self, obs: Observation, ctx: SessionContext) -> Action:
+        self._load_model()
+        assert self._model is not None
+
+        text, images, state_norm = self._encode_one(obs)
+
         eagle_out = self._eagle_processor(text=text, images=images, return_tensors="pt", padding=False)
 
         inputs = {
@@ -526,13 +533,61 @@ class GR00TBaseModelServer(PredictModelServer):
             "eagle_attention_mask": eagle_out["attention_mask"].to(self._device),
             "eagle_pixel_values": eagle_out["pixel_values"].to(self._device),
             "embodiment_id": torch.tensor([self._embodiment_id], dtype=torch.long, device=self._device),
-            "state": torch.from_numpy(state_norm).unsqueeze(0).to(self._device),
+            "state": torch.from_numpy(state_norm[np.newaxis, np.newaxis]).to(self._device),
         }
 
-        # --- Inference ---
         actions_padded = self._model.predict(inputs)  # (1, action_horizon, max_action_dim)
         actions_denorm = self._action_inverse(actions_padded[0].float())  # (action_horizon, action_dim)
         return {"actions": actions_denorm.cpu().numpy().astype(np.float32)}
+
+    def predict_batch(
+        self,
+        obs_batch: list[Observation],
+        ctx_batch: list[SessionContext],
+    ) -> list[Action]:
+        """Run batched inference for ``len(obs_batch)`` observations in one GPU call.
+
+        Mirrors the training-time call pattern: text/images are flattened across
+        the batch and passed to ``EagleProcessor`` with ``padding=True``.  Model
+        inputs follow the shapes documented in ``GR00T_N1_5_Base.predict``:
+        ``eagle_input_ids`` (B, S), ``embodiment_id`` (B,), ``state`` (B, 1, D),
+        and a flat ``eagle_pixel_values`` of all tiles concatenated.
+        """
+        self._load_model()
+        assert self._model is not None
+
+        B = len(obs_batch)
+        texts: list[str] = []
+        flat_images: list[Image.Image] = []
+        states: list[np.ndarray] = []
+
+        for obs in obs_batch:
+            text, images, state_norm = self._encode_one(obs)
+            texts.append(text)
+            flat_images.extend(images)
+            states.append(state_norm)
+
+        eagle_out = self._eagle_processor(
+            text=texts, images=flat_images, return_tensors="pt", padding=True
+        )
+
+        state_batch = torch.from_numpy(np.stack(states)).unsqueeze(1).float()  # (B, 1, max_state_dim)
+
+        inputs = {
+            "eagle_input_ids": eagle_out["input_ids"].to(self._device),
+            "eagle_attention_mask": eagle_out["attention_mask"].to(self._device),
+            "eagle_pixel_values": eagle_out["pixel_values"].to(self._device),
+            "embodiment_id": torch.full((B,), self._embodiment_id, dtype=torch.long, device=self._device),
+            "state": state_batch.to(self._device),
+        }
+
+        actions_padded = self._model.predict(inputs)  # (B, action_horizon, max_action_dim)
+
+        results: list[Action] = []
+        for i in range(B):
+            actions_denorm = self._action_inverse(actions_padded[i].float())
+            results.append({"actions": actions_denorm.cpu().numpy().astype(np.float32)})
+        return results
 
 
 if __name__ == "__main__":
@@ -547,6 +602,18 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer_dir", default=None, help="Eagle tokenizer data directory (default: bundled)")
     parser.add_argument("--chunk_size", type=int, default=16, help="Action horizon / chunk size (default 16)")
     parser.add_argument("--action_ensemble", default="newest")
+    parser.add_argument(
+        "--max_batch_size",
+        type=int,
+        default=1,
+        help="Max observations per GPU batch (default 1 = no batching). Requires predict_batch().",
+    )
+    parser.add_argument(
+        "--max_wait_time",
+        type=float,
+        default=0.01,
+        help="Seconds to wait for a full batch before dispatching a partial one (default 0.01).",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -566,6 +633,8 @@ if __name__ == "__main__":
         tokenizer_dir=args.tokenizer_dir,
         chunk_size=args.chunk_size,
         action_ensemble=args.action_ensemble,
+        max_batch_size=args.max_batch_size,
+        max_wait_time=args.max_wait_time,
     )
 
     logger.info("Pre-loading model...")
