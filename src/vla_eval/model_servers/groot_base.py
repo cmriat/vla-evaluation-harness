@@ -2,8 +2,8 @@
 # requires-python = "~=3.11"
 # dependencies = [
 #     "vla-eval",
-#     "torch>=2.5",
-#     "torchvision",
+#     "torch>=2.5,<2.7",        # 限制上界: torch 2.7+ 需要 CUDA 13.0 driver，当前集群为 12.8
+#     "torchvision>=0.20,<0.22",
 #     "safetensors",
 #     "tokenizers",
 #     "pandas",
@@ -337,8 +337,14 @@ def _load_checkpoint(model: Any, ckpt_path: str) -> None:
         import torch.distributed.checkpoint as dcp
 
         if not dist.is_initialized():
+            import socket
+
             os.environ.setdefault("MASTER_ADDR", "localhost")
-            os.environ.setdefault("MASTER_PORT", "29501")
+            # 自动分配空闲端口，避免多实例同时加载 DCP checkpoint 时端口冲突
+            if "MASTER_PORT" not in os.environ:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("", 0))
+                    os.environ["MASTER_PORT"] = str(s.getsockname()[1])
             dist.init_process_group(backend="gloo", rank=0, world_size=1)
         model_sd = model.state_dict()
         dcp.load({"model": model_sd}, checkpoint_id=str(ckpt))
