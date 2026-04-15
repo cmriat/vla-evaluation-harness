@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import logging
 import os
 import sys
@@ -165,8 +166,15 @@ def _run_via_docker(
     dev: bool = False,
     shard_id: int | None = None,
     num_shards: int | None = None,
+    inner_args: list[str] | None = None,
 ) -> None:
-    """Execute the evaluation inside a Docker container."""
+    """Execute a command inside a Docker container.
+
+    ``inner_args`` are appended after the image name.  Defaults to
+    ``["run", "--no-docker", "--config", "/tmp/eval_config.yaml"]``.
+    """
+    if inner_args is None:
+        inner_args = ["run", "--no-docker", "--config", "/tmp/eval_config.yaml"]
     import shutil
 
     docker = shutil.which("docker")
@@ -237,7 +245,7 @@ def _run_via_docker(
     else:
         cmd.extend(gpu_docker_flag(docker_cfg.gpus))
 
-    cmd.extend([docker_cfg.image, "run", "--no-docker", "--config", "/tmp/eval_config.yaml"])
+    cmd.extend([docker_cfg.image] + inner_args)
     if shard_id is not None:
         cmd.extend(["--shard-id", str(shard_id), "--num-shards", str(num_shards)])
 
@@ -300,6 +308,73 @@ def cmd_run(args: argparse.Namespace) -> None:
     # Print final summary
     for r in results:
         print(f"\n{r['benchmark']}: {r['overall_success_rate']:.1%}")
+
+
+def cmd_prepare_tasks(args: argparse.Namespace) -> None:
+    """Run expert checks once and cache the validated task list for sharded evaluation."""
+    config = _load_config(args.config)
+
+    docker_cfg = DockerConfig.from_dict(config.get("docker"))
+    use_docker = bool(docker_cfg.image) and not getattr(args, "no_docker", False) and not _inside_docker()
+
+    if use_docker:
+        num_workers = getattr(args, "workers", 1) or 1
+        inner = ["prepare-tasks", "--no-docker", "--config", "/tmp/eval_config.yaml", "--workers", str(num_workers)]
+        _run_via_docker(
+            config,
+            auto_yes=getattr(args, "yes", False),
+            dev=getattr(args, "dev", False),
+            inner_args=inner,
+        )
+        return
+
+    # Running inside Docker (or --no-docker): actually prepare the tasks.
+    import re
+
+    from vla_eval.config import EvalConfig
+    from vla_eval.registry import resolve_import_string
+
+    num_workers = getattr(args, "workers", 1) or 1
+
+    output_dir = Path(config.get("output_dir", "./results"))
+    tasks_dir = output_dir / ".prepared_tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    for bench_cfg in config.get("benchmarks", []):
+        cfg = EvalConfig.from_dict(bench_cfg)
+        safe_name = re.sub(r"[^\w\-.]", "_", cfg.resolved_name())
+
+        benchmark_cls = resolve_import_string(cfg.benchmark)
+        benchmark = benchmark_cls(**cfg.params)
+
+        try:
+            try:
+                tasks = benchmark.get_tasks(num_workers=num_workers)
+            except TypeError:
+                # Benchmark does not support num_workers (non-RoboTwin)
+                tasks = benchmark.get_tasks()
+        finally:
+            benchmark.cleanup()
+
+        # Apply same filters as orchestrator
+        if cfg.tasks:
+            tasks = [t for t in tasks if t.get("suite") in cfg.tasks or t.get("name") in cfg.tasks]
+        if cfg.max_tasks:
+            tasks = tasks[: cfg.max_tasks]
+
+        out_path = tasks_dir / f"{safe_name}.json"
+        # Serialise tasks separately with default=str (handles numpy types),
+        # but keep params as plain JSON so the orchestrator's == check works.
+        tasks_serialisable = json.loads(json.dumps(tasks, default=str))
+        out_path.write_text(
+            json.dumps(
+                {"benchmark": safe_name, "params": cfg.params, "tasks": tasks_serialisable},
+                indent=2,
+            )
+        )
+        logger.info("Prepared %d tasks for %s -> %s", len(tasks), safe_name, out_path)
+
+    logger.info("Task preparation complete.")
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -729,6 +804,38 @@ execution flow:
     )
     run_parser.add_argument("--verbose", "-v", action="store_true")
     run_parser.set_defaults(func=cmd_run)
+
+    # prepare-tasks command
+    prepare_parser = sub.add_parser(
+        "prepare-tasks",
+        help="Run expert checks once and cache the task list for sharded evaluation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Runs benchmark.get_tasks() (including expert checks) once and saves the
+validated task list to {output_dir}/.prepared_tasks/{name}.json.
+
+Subsequent 'vla-eval run' invocations will load the cached tasks instead
+of re-running expert checks, which is especially useful for sharded runs
+where each shard would otherwise repeat the same expensive checks.
+
+examples:
+  vla-eval prepare-tasks -c configs/robotwin_eval.yaml
+  vla-eval prepare-tasks --dev -c configs/robotwin_eval.yaml -y
+""",
+    )
+    prepare_parser.add_argument("--config", "-c", required=True, help="Path to YAML config file")
+    prepare_parser.add_argument(
+        "--workers", "-w", type=int, default=1, help="Number of parallel workers for expert check (default: 1)"
+    )
+    prepare_parser.add_argument(
+        "--no-docker", action="store_true", help="Run directly without Docker (for inside-container use)"
+    )
+    prepare_parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompts")
+    prepare_parser.add_argument(
+        "--dev", action="store_true", help="Mount local src/ into the container (skip image rebuild on code changes)"
+    )
+    prepare_parser.add_argument("--verbose", "-v", action="store_true")
+    prepare_parser.set_defaults(func=cmd_prepare_tasks)
 
     # serve command
     serve_parser = sub.add_parser(

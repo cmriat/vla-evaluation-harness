@@ -27,6 +27,66 @@ logger = logging.getLogger(__name__)
 
 ROBOTWIN_ROOT = "/app/RoboTwin"
 
+# ---------------------------------------------------------------------------
+# Multiprocessing helpers for parallel expert check
+# ---------------------------------------------------------------------------
+_worker_state: dict[str, Any] = {}
+
+
+def _worker_init(
+    task_name: str,
+    args: dict[str, Any],
+    instruction_type: str,
+    test_num: int,
+) -> None:
+    """Initialise a worker process: add RoboTwin to path, create env."""
+    for p in [ROBOTWIN_ROOT, f"{ROBOTWIN_ROOT}/policy", f"{ROBOTWIN_ROOT}/description/utils"]:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    os.chdir(ROBOTWIN_ROOT)
+
+    envs_module = importlib.import_module(f"envs.{task_name}")
+    env_class = getattr(envs_module, task_name)
+
+    _worker_state["env"] = env_class()
+    _worker_state["args"] = args
+    _worker_state["task_name"] = task_name
+    _worker_state["instruction_type"] = instruction_type
+    _worker_state["test_num"] = test_num
+
+
+def _check_seed(seed: int) -> dict[str, Any] | None:
+    """Check one seed via oracle planner.  Returns a task dict or ``None``."""
+    env = _worker_state["env"]
+    args = _worker_state["args"]
+    task_name = _worker_state["task_name"]
+
+    try:
+        # now_ep_num=0: in parallel mode we don't know the final episode index yet;
+        # it is reassigned after collecting and sorting all valid seeds.
+        env.setup_demo(now_ep_num=0, seed=seed, is_test=True, **args)
+        episode_info = env.play_once()
+        env.close_env()
+        if env.plan_success and env.check_success():
+            from generate_episode_instructions import generate_episode_descriptions
+
+            results = generate_episode_descriptions(
+                task_name,
+                [episode_info["info"]],
+                _worker_state["test_num"],
+            )
+            rng = np.random.RandomState(seed)
+            instruction = rng.choice(results[0][_worker_state["instruction_type"]])
+            return {"name": task_name, "suite": "robotwin", "seed": seed, "instruction": str(instruction)}
+        return None
+    except Exception as exc:
+        logger.warning("Expert check worker failed for seed %d: %s", seed, exc)
+        try:
+            env.close_env()
+        except Exception:
+            pass
+        return None
+
 
 class RoboTwinBenchmark(StepBenchmark):
     """RoboTwin dual-arm manipulation benchmark (SAPIEN/CuRobo).
@@ -149,7 +209,7 @@ class RoboTwinBenchmark(StepBenchmark):
     # StepBenchmark interface
     # -----------------------------------------------------------------
 
-    def get_tasks(self) -> list[Task]:
+    def get_tasks(self, num_workers: int = 1) -> list[Task]:
         self._init_robotwin()
         assert self._args is not None
         st_seed = 100000 * (1 + self.seed)
@@ -166,16 +226,25 @@ class RoboTwinBenchmark(StepBenchmark):
                 for i in range(self.test_num)
             ]
 
-        # Full expert check — run oracle planner per seed
+        if num_workers > 1:
+            return self._get_tasks_parallel(st_seed, num_workers)
+
+        # Full expert check — run oracle planner per seed (single process)
         from generate_episode_instructions import generate_episode_descriptions
 
         env = self._create_env()
         tasks: list[Task] = []
         now_seed = st_seed
+        max_seed = st_seed + self.test_num * 20
         episode_idx = 0
         logger.info("Running expert checks from seed %d ...", st_seed)
 
         while len(tasks) < self.test_num:
+            if now_seed >= max_seed:
+                raise RuntimeError(
+                    f"Exhausted {self.test_num * 20} seeds without finding {self.test_num} valid episodes "
+                    f"(found {len(tasks)}). Task '{self.task_name}' may be broken."
+                )
             try:
                 env.setup_demo(
                     now_ep_num=episode_idx,
@@ -191,7 +260,8 @@ class RoboTwinBenchmark(StepBenchmark):
                         [episode_info["info"]],
                         self.test_num,
                     )
-                    instruction = np.random.choice(
+                    rng = np.random.RandomState(now_seed)
+                    instruction = rng.choice(
                         results[0][self.instruction_type],
                     )
                     tasks.append(
@@ -211,6 +281,55 @@ class RoboTwinBenchmark(StepBenchmark):
                 except Exception:
                     pass
             now_seed += 1
+        return tasks
+
+    def _get_tasks_parallel(self, st_seed: int, num_workers: int) -> list[Task]:
+        """Run expert checks in parallel using a process pool.
+
+        Uses ``spawn`` start method to avoid inheriting parent GPU state.
+        Seeds are processed in finite batches to avoid unbounded memory from
+        feeding an infinite iterator into ``imap_unordered``.
+        """
+        from multiprocessing import get_context
+
+        logger.info(
+            "Running parallel expert checks from seed %d with %d workers ...",
+            st_seed,
+            num_workers,
+        )
+
+        ctx = get_context("spawn")
+        tasks: list[Task] = []
+        next_seed = st_seed
+        max_seed = st_seed + self.test_num * 20
+        batch_size = num_workers * 10
+
+        with ctx.Pool(
+            num_workers,
+            initializer=_worker_init,
+            initargs=(self.task_name, self._args, self.instruction_type, self.test_num),
+        ) as pool:
+            while len(tasks) < self.test_num:
+                if next_seed >= max_seed:
+                    raise RuntimeError(
+                        f"Exhausted {self.test_num * 20} seeds without finding {self.test_num} valid episodes "
+                        f"(found {len(tasks)}). Task '{self.task_name}' may be broken."
+                    )
+                seeds = range(next_seed, min(next_seed + batch_size, max_seed))
+                next_seed += batch_size
+                for result in pool.imap_unordered(_check_seed, seeds, chunksize=1):
+                    if result is not None:
+                        tasks.append(result)
+                        logger.info("Expert check: %d/%d valid seeds found", len(tasks), self.test_num)
+                        if len(tasks) >= self.test_num:
+                            break
+
+        # Sort by seed for deterministic ordering, trim to exact count, assign episode_idx
+        tasks.sort(key=lambda t: t["seed"])
+        tasks = tasks[: self.test_num]
+        for i, t in enumerate(tasks):
+            t["episode_idx"] = i
+
         return tasks
 
     def reset(self, task: Task) -> Any:

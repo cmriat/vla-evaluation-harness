@@ -99,8 +99,20 @@ class Orchestrator:
         else:
             runner = SyncEpisodeRunner()
 
-        # Get tasks
-        tasks = benchmark.get_tasks()
+        # Get tasks — use prepared cache if available (from `vla-eval prepare-tasks`)
+        safe_name = re.sub(r"[^\w\-.]", "_", name)
+        prepared_path = Path(self.config.get("output_dir", "./results")) / ".prepared_tasks" / f"{safe_name}.json"
+        if prepared_path.exists():
+            prepared = json.loads(prepared_path.read_text())
+            # Verify cached params match current config to avoid stale results
+            if prepared.get("params") == cfg.params:
+                tasks = prepared["tasks"]
+                logger.info("Loaded %d prepared tasks from %s (expert check cached)", len(tasks), prepared_path)
+            else:
+                logger.warning("Prepared tasks params mismatch, re-running expert check")
+                tasks = benchmark.get_tasks()
+        else:
+            tasks = benchmark.get_tasks()
         if cfg.tasks:
             tasks = [t for t in tasks if t.get("suite") in cfg.tasks or t.get("name") in cfg.tasks]
         if cfg.max_tasks:

@@ -45,56 +45,52 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-# Derive output name from config filename if not specified
+# Derive run directory and output name
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+config_name="$(basename "$CONFIG" .yaml)"
+config_name="$(basename "$config_name" .yml)"
+RUN_DIR="results/${config_name}_${TIMESTAMP}"
 if [[ -z "$OUTPUT" ]]; then
-  config_name="$(basename "$CONFIG" .yaml)"
-  config_name="$(basename "$config_name" .yml)"
-  OUTPUT="results/${config_name}.json"
+  OUTPUT="${RUN_DIR}/${config_name}.json"
 fi
+
+# Create a temporary config with output_dir pointing to the timestamped run directory
+ORIG_CONFIG="$CONFIG"
+RUN_CONFIG=$(mktemp /tmp/vla-eval-sharded-XXXXXX.yaml)
+ORIG_CONFIG="$ORIG_CONFIG" RUN_DIR="$RUN_DIR" RUN_CONFIG="$RUN_CONFIG" python3 -c "
+import os, yaml
+with open(os.environ['ORIG_CONFIG']) as f:
+    cfg = yaml.safe_load(f)
+cfg['output_dir'] = os.environ['RUN_DIR']
+with open(os.environ['RUN_CONFIG'], 'w') as f:
+    yaml.safe_dump(cfg, f)
+"
+# Use the timestamped config for all subsequent commands
+CONFIG="$RUN_CONFIG"
 
 mkdir -p "$LOG_DIR"
 
 cleanup() {
   echo "Cleaning up background processes..."
   kill -- -$$ 2>/dev/null || true
+  rm -f "$RUN_CONFIG" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo "Config:     $CONFIG"
 echo "Shards:     $NUM_SHARDS"
+echo "Run dir:    $RUN_DIR"
 echo "Output:     $OUTPUT"
 echo "Log dir:    $LOG_DIR"
 echo "Mode:       --dev (mounting local src/)"
 echo ""
 
-# Check for existing shard results
-existing=$(CONFIG="$CONFIG" NUM_SHARDS="$NUM_SHARDS" python3 -c "
-import os, yaml, re
-from pathlib import Path
-with open(os.environ['CONFIG']) as f:
-    cfg = yaml.safe_load(f)
-num_shards = os.environ['NUM_SHARDS']
-output_dir = Path(cfg.get('output_dir', './results'))
-found = []
-seen = set()
-for b in cfg.get('benchmarks', []):
-    name = b.get('name') or b['benchmark'].rsplit(':', 1)[-1]
-    sub = b.get('subname')
-    if sub:
-        name = f'{name}_{sub}'
-    safe = re.sub(r'[^\w\-.]', '_', name)
-    if safe in seen:
-        continue
-    seen.add(safe)
-    found.extend(output_dir.glob(f'{safe}_shard*of{num_shards}.json'))
-if found:
-    print(f'{len(found)} existing shard file(s) found, e.g.: {found[0]}')
-")
-if [[ -n "$existing" ]]; then
-  echo "Error: $existing" >&2
-  echo "Remove existing results or use a different output_dir." >&2
-  exit 1
-fi
+mkdir -p "$RUN_DIR"
+
+echo "Preparing tasks (running expert check once with ${NUM_SHARDS} workers)..."
+vla-eval prepare-tasks --dev -c "$CONFIG" -y --workers "$NUM_SHARDS"
+echo "Task preparation complete."
+echo ""
 
 echo "Launching ${NUM_SHARDS} shards..."
 
@@ -128,6 +124,9 @@ fi
 echo ""
 echo "Merging results..."
 vla-eval merge -c "$CONFIG" -o "$OUTPUT"
+
+# Clean up prepared tasks cache (may be owned by root from Docker)
+rm -rf "${RUN_DIR}/.prepared_tasks" 2>/dev/null || docker run --rm -v "$(cd "$(dirname "$RUN_DIR")" && pwd)/$(basename "$RUN_DIR"):/cleanup" alpine rm -rf /cleanup/.prepared_tasks
 
 echo "Done. Results saved to $OUTPUT"
 
