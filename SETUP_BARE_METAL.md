@@ -354,3 +354,26 @@ self._ws = await websockets.connect(self.url, **kwargs)
 vla-eval run --dev --config configs/libero_smoke_test.yaml
 ```
 > `--dev` 标志会把本地修改过的 `src/` 目录挂载到 Docker 容器的 `/workspace/src`，这样容器内会使用你本地的代码改动（如 10.5 中的 SSL 修改），而不需要重新构建镜像。
+
+## 11. Docker 镜像调试常用命令
+
+> 有时需要查看 benchmark 镜像内部的文件内容或目录结构，可以用 `--entrypoint ""` 覆盖默认入口点，直接在容器内执行任意命令。
+
+### 11.1 查看镜像内的文件内容
+```zsh
+docker run --rm --entrypoint "" ghcr.io/allenai/vla-evaluation-harness/robotwin:latest \
+  cat /app/RoboTwin/task_config/demo_clean.yml
+```
+
+### 11.2 查看镜像内的目录结构
+```zsh
+docker run --rm --entrypoint "" ghcr.io/allenai/vla-evaluation-harness/robotwin:latest \
+  ls /app/RoboTwin/task_config/
+```
+
+### 11.3 进入镜像交互式调试
+如果需要更深入地排查问题，可以直接进入容器的 shell：
+```zsh
+docker run --rm -it --entrypoint bash ghcr.io/allenai/vla-evaluation-harness/robotwin:latest
+```
+

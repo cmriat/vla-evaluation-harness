@@ -12,4 +12,4 @@ args:
   chunk_size: 16
   max_batch_size: 1      # <-- 默认 1，调大开启 batching
   max_wait_time: 0.05     # <-- 等 50ms 凑max_batch_size数量
-  port: 8000
+  port: 8003
